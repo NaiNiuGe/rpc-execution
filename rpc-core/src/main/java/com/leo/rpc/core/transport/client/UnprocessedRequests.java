@@ -1,6 +1,8 @@
 package com.leo.rpc.core.transport.client;
 
 import com.leo.rpc.common.model.RpcResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -8,38 +10,42 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 未处理的RPC请求管理器
- * <p>
- * 使用CompletableFuture实现异步RPC调用，每个请求对应一个Future，
- * 当收到响应时complete对应的Future。
  */
 public class UnprocessedRequests {
 
-    private static final Map<String, CompletableFuture<RpcResponse<?>>> UNPROCESSED_RESPONSES =
+    private static final Logger log = LoggerFactory.getLogger(UnprocessedRequests.class);
+
+    private final Map<String, CompletableFuture<RpcResponse<?>>> unprocessedResponses =
             new ConcurrentHashMap<>();
 
     /**
-     * 注册一个新的请求
+     * 注册新的请求
      */
     public void put(String requestId, CompletableFuture<RpcResponse<?>> future) {
-        UNPROCESSED_RESPONSES.put(requestId, future);
+        unprocessedResponses.put(requestId, future);
     }
 
     /**
-     * 完成一个请求
+     * 完成请求
      */
     public void complete(RpcResponse<?> response) {
-        CompletableFuture<RpcResponse<?>> future = UNPROCESSED_RESPONSES.remove(response.getRequestId());
-        if (future != null) {
-            future.complete(response);
-        } else {
-            throw new IllegalStateException("未找到对应的请求: " + response.getRequestId());
+        if (response == null || response.getRequestId() == null) {
+            log.warn("忽略空响应");
+            return;
         }
+
+        CompletableFuture<RpcResponse<?>> future = remove(response.getRequestId());
+        if (future == null) {
+            log.debug("忽略过期或重复响应: requestId={}", response.getRequestId());
+            return;
+        }
+        future.complete(response);
     }
 
     /**
-     * 移除一个请求
+     * 移除请求
      */
-    public void remove(String requestId) {
-        UNPROCESSED_RESPONSES.remove(requestId);
+    public CompletableFuture<RpcResponse<?>> remove(String requestId) {
+        return unprocessedResponses.remove(requestId);
     }
 }

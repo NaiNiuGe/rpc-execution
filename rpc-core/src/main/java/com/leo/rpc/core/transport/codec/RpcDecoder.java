@@ -1,5 +1,6 @@
 package com.leo.rpc.core.transport.codec;
 
+import com.leo.rpc.common.enums.RpcResponseCode;
 import com.leo.rpc.common.exception.RpcException;
 import com.leo.rpc.common.model.RpcRequest;
 import com.leo.rpc.common.model.RpcResponse;
@@ -11,10 +12,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * RPC解码器
- * <p>
- * 继承LengthFieldBasedFrameDecoder，基于长度字段的帧解码器，解决TCP粘包/拆包问题。
- * 然后根据协议头解析消息体，使用Kryo反序列化。
+ * RPC decoder.
  */
 public class RpcDecoder extends LengthFieldBasedFrameDecoder {
 
@@ -22,23 +20,13 @@ public class RpcDecoder extends LengthFieldBasedFrameDecoder {
 
     private final Serializer serializer;
 
-    /**
-     * 构造方法
-     *
-     * @param serializer 序列化器
-     */
     public RpcDecoder(Serializer serializer) {
-        // maxFrameLength, lengthFieldOffset, lengthFieldLength, lengthAdjustment, initialBytesToStrip
-        // 长度字段偏移量 = magic(2) + version(1) + msgType(1) + status(1) + requestId(8) = 13
-        // 长度字段自身长度 = 4
-        // 不跳过任何字节，在decode方法中手动读取协议头
         super(RpcProtocolConstants.MAX_FRAME_LENGTH, 13, 4, 0, 0);
         this.serializer = serializer;
     }
 
     @Override
     protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
-        // 先由父类根据长度字段解码出完整的帧
         Object decoded = super.decode(ctx, in);
         if (decoded == null) {
             return null;
@@ -53,55 +41,90 @@ public class RpcDecoder extends LengthFieldBasedFrameDecoder {
     }
 
     private Object decodeFrame(ByteBuf frame) {
-        // 检查可读字节是否足够
         if (frame.readableBytes() < RpcProtocolConstants.HEADER_LENGTH) {
-            throw new RpcException("帧长度不足，无法解析协议头");
+            throw new RpcException("Frame length is too short");
         }
 
-        // 读取魔数
         short magic = frame.readShort();
         if (magic != RpcProtocolConstants.MAGIC) {
-            throw new RpcException("无效的魔数: " + Integer.toHexString(magic));
+            throw new RpcException("Invalid magic number: " + Integer.toHexString(magic));
         }
 
-        // 读取版本号
         byte version = frame.readByte();
         if (version != RpcProtocolConstants.VERSION) {
-            throw new RpcException("不支持的协议版本: " + version);
+            throw new RpcException("Unsupported protocol version: " + version);
         }
 
-        // 读取消息类型
         byte msgType = frame.readByte();
-
-        // 读取状态位
         byte status = frame.readByte();
-
-        // 读取请求ID
-        long requestId = frame.readLong();
-
-        // 读取数据长度
+        long requestIdHash = frame.readLong();
         int dataLength = frame.readInt();
 
         if (dataLength <= 0) {
-            throw new RpcException("无效的数据长度: " + dataLength);
+            throw new RpcException("Invalid data length: " + dataLength);
+        }
+        if (frame.readableBytes() < dataLength) {
+            throw new RpcException("Body length is insufficient: expected=" + dataLength + ", actual=" + frame.readableBytes());
         }
 
-        // 读取数据
         byte[] data = new byte[dataLength];
         frame.readBytes(data);
 
-        // 根据消息类型反序列化
-        Class<?> targetClass;
-        if (msgType == RpcProtocolConstants.MSG_TYPE_REQUEST) {
-            targetClass = RpcRequest.class;
-        } else if (msgType == RpcProtocolConstants.MSG_TYPE_RESPONSE) {
-            targetClass = RpcResponse.class;
-        } else {
-            throw new RpcException("不支持的消息类型: " + msgType);
+        if (msgType == RpcProtocolConstants.MSG_TYPE_REQUEST
+                || msgType == RpcProtocolConstants.MSG_TYPE_HEARTBEAT_REQUEST) {
+            RpcRequest request = serializer.deserialize(data, RpcRequest.class);
+            validateRequest(request, requestIdHash, msgType, status);
+            log.debug("Decoded message: type={}, length={}", RpcRequest.class.getSimpleName(), dataLength);
+            return request;
         }
 
-        Object result = serializer.deserialize(data, targetClass);
-        log.debug("解码消息: type={}, length={}", targetClass.getSimpleName(), dataLength);
-        return result;
+        if (msgType == RpcProtocolConstants.MSG_TYPE_RESPONSE
+                || msgType == RpcProtocolConstants.MSG_TYPE_HEARTBEAT_RESPONSE) {
+            RpcResponse<?> response = serializer.deserialize(data, RpcResponse.class);
+            validateResponse(response, requestIdHash, msgType, status);
+            log.debug("Decoded message: type={}, length={}", RpcResponse.class.getSimpleName(), dataLength);
+            return response;
+        }
+
+        throw new RpcException("Unsupported message type: " + msgType);
+    }
+
+    private void validateRequest(RpcRequest request, long requestIdHash, byte msgType, byte status) {
+        if (request == null || request.getRequestId() == null) {
+            throw new RpcException("Request body is empty");
+        }
+        if (request.getRequestId().hashCode() != (int) requestIdHash) {
+            throw new RpcException("Request id validation failed");
+        }
+
+        boolean heartbeat = msgType == RpcProtocolConstants.MSG_TYPE_HEARTBEAT_REQUEST;
+        if (heartbeat != RpcProtocolConstants.isHeartbeatRequest(request)) {
+            throw new RpcException("Request type does not match body");
+        }
+
+        byte expectedStatus = heartbeat ? (byte) RpcResponseCode.HEARTBEAT_REQUEST.getCode() : 0;
+        if (status != expectedStatus) {
+            throw new RpcException("Request status validation failed");
+        }
+    }
+
+    private void validateResponse(RpcResponse<?> response, long requestIdHash, byte msgType, byte status) {
+        if (response == null || response.getRequestId() == null) {
+            throw new RpcException("Response body is empty");
+        }
+        if (response.getRequestId().hashCode() != (int) requestIdHash) {
+            throw new RpcException("Response id validation failed");
+        }
+        if (response.getCode() == null) {
+            throw new RpcException("Response code is empty");
+        }
+        if (status != response.getCode().byteValue()) {
+            throw new RpcException("Response status does not match body");
+        }
+
+        boolean heartbeat = msgType == RpcProtocolConstants.MSG_TYPE_HEARTBEAT_RESPONSE;
+        if (heartbeat != RpcProtocolConstants.isHeartbeatResponse(response)) {
+            throw new RpcException("Response type does not match body");
+        }
     }
 }

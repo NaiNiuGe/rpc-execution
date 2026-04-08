@@ -55,9 +55,31 @@ public class RpcResponse<T> implements Serializable {
      * 失败响应
      */
     public static <T> RpcResponse<T> fail(String message) {
+        return fail(RpcResponseCode.FAIL, message, null);
+    }
+
+    /**
+     * 失败响应
+     */
+    public static <T> RpcResponse<T> fail(RpcResponseCode responseCode, String message, String requestId) {
         RpcResponse<T> response = new RpcResponse<>();
-        response.setCode(RpcResponseCode.FAIL.getCode());
-        response.setMessage(message);
+        response.setRequestId(requestId);
+        response.setCode(responseCode.getCode());
+        response.setMessage(message == null ? responseCode.getMessage() : message);
         return response;
+    }
+
+    /**
+     * 失败响应
+     */
+    public static <T> RpcResponse<T> fail(RpcResponseCode responseCode, String requestId) {
+        return fail(responseCode, responseCode.getMessage(), requestId);
+    }
+
+    /**
+     * 心跳响应
+     */
+    public static <T> RpcResponse<T> heartbeatResponse(String requestId) {
+        return fail(RpcResponseCode.HEARTBEAT_RESPONSE, requestId);
     }
 }
